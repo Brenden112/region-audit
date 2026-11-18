@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Region Audit — 地区自审</title>
+<style>
+ body{font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;margin:24px;max-width:1100px;background:#0e1116;color:#d7dde5}
+ h1{font-size:18px;margin:0 0 4px} h2{font-size:14px;margin:22px 0 8px;color:#7fb3ff;letter-spacing:.04em}
+ .muted{color:#8b97a8} table{border-collapse:collapse;width:100%;margin:6px 0}
+ th,td{border:1px solid #26303c;padding:5px 8px;text-align:left;vertical-align:top;font-size:12.5px}
+ th{background:#151b23;color:#9fb0c4} .ok{color:#63d18b} .bad{color:#ff7b72} .warn{color:#e3b341}
+ pre{background:#151b23;border:1px solid #26303c;padding:10px;overflow:auto;font-size:12px;white-space:pre-wrap}
+ code{color:#9ecbff}
+</style>
+</head>
+<body>
+<h1>Region Audit <span class="muted">/ 地区自审</span></h1>
+<div class="muted">一个静态审计页：读取浏览器自报事实、页面所在 CDN 响应头、以及多个第三方 IP 情报源，做一致性交叉判定。结果同时回传到 webhook.site 以便服务端留痕。</div>
+
+<h2>1. 浏览器自报 (navigator / Intl)</h2><pre id="env">collecting…</pre>
+<h2>2. 本页由谁提供 (same-origin response headers)</h2><pre id="srv">collecting…</pre>
+<h2>3. 多源 IP / 地理情报</h2><table id="geo"><thead><tr><th>source</th><th>ip</th><th>country</th><th>city</th><th>timezone</th><th>org / flags</th></tr></thead><tbody></tbody></table>
+<h2>4. 对抗式判定</h2><pre id="verdict">…</pre>
+<h2>5. WebRTC 泄漏候选</h2><pre id="rtc">collecting…</pre>
+<h2>6. 原始报告</h2><pre id="raw">…</pre>
+
+<script>
+(function(){
+  var HOOK = "https://webhook.site/3d90b8c1-cdc0-48c3-9ed6-7e3d52673cea";
+  var R = {collectedAt:new Date().toISOString(), href:location.href, referrer:document.referrer||null};
+  var tzo = Intl.DateTimeFormat().resolvedOptions();
+  R.browser = {
+    timeZone: tzo.timeZone, locale: tzo.locale, utcOffsetMinutes: -new Date().getTimezoneOffset(),
+    offsetName: new Date().toString().split(" (")[1] || null,
+    languages: navigator.languages, language: navigator.language,
+    platform: navigator.platform, webdriver: navigator.webdriver,
+    hardwareConcurrency: navigator.hardwareConcurrency, deviceMemory: navigator.deviceMemory,
+    maxTouchPoints: navigator.maxTouchPoints, cookieEnabled: navigator.cookieEnabled,
+    screen: screen.width + "x" + screen.height + "@" + screen.colorDepth,
+    dpr: window.devicePixelRatio, ua: navigator.userAgent
+  };
+  if (navigator.userAgentData) R.browser.uaData = {brands:navigator.userAgentData.brands, mobile:navigator.userAgentData.mobile, platform:navigator.userAgentData.platform};
+  document.getElementById("env").textContent = JSON.stringify(R.browser, null, 1);
+
+  function headersOf(sameOrigin){
+    return fetch(sameOrigin, {cache:"no-store", redirect:"follow"}).then(function(r){
+      var h = {}; r.headers.forEach(function(v,k){ h[k]=v; });
+      return {status:r.status, url:r.url, headers:h};
+    });
+  }
+  headersOf(location.href).then(function(x){
+    R.selfResponse = x;
+    document.getElementById("srv").textContent = JSON.stringify(x, null, 1);
+  }).catch(function(e){ document.getElementById("srv").textContent = "ERR " + e; });
+
+  var probes = [
+    {n:"ipify", u:"https://api.ipify.org?format=json", f:function(j){return {ip:j.ip};}},
+    {n:"ipwho.is", u:"https://ipwho.is/", f:function(j){return {ip:j.ip,country:j.country_code,city:j.city,tz:j.timezone&&j.timezone.id,org:j.connection&&j.connection.isp,extra:{type:j.type,asn:j.connection&&j.connection.asn};};}},
+    {n:"ipapi.co", u:"https://ipapi.co/json/", f:function(j){return {ip:j.ip,country:j.country_code,city:j.city,tz:j.timezone,org:j.org,extra:{asn:j.asn,continent:j.continent_code};};}},
+    {n:"ipapi.is", u:"https://api.ipapi.is/", f:function(j){return {ip:j.ip,country:j.location&&j.location.country_code,city:j.location&&j.location.city,tz:j.location&&j.location.timezone,org:j.asn&&j.asn.org,extra:{proxy:j.is_proxy,vpn:j.is_vpn,dc:j.is_datacenter,tor:j.is_tor};};}},
+    {n:"ipinfo.io", u:"https://ipinfo.io/json", f:function(j){return {ip:j.ip,country:j.country,city:j.city,tz:j.timezone,org:j.org};}},
+    {n:"cloudflare-trace", u:"https://www.cloudflare.com/cdn-cgi/trace", text:true, f:function(t){
+        var o={}; t.split("\n").forEach(function(line){ var i=line.indexOf("="); if(i>0) o[line.slice(0,i)]=line.slice(i+1); });
+        return {ip:o.ip,country:o.loc,city:"(colo "+ o.colo +")",tz:null,org:"warp="+o.warp};
+    }}
+  ];
+
+  function one(p){
+    var ctl = new AbortController();
+    var to = setTimeout(function(){ ctl.abort(); }, 9000);
+    return fetch(p.u, {signal:ctl.signal, cache:"no-store", mode:"cors"}).then(function(r){
+      return r.text().then(function(t){ clearTimeout(to); if(!r.ok) throw new Error("HTTP "+r.status); return p.text ? p.f(t) : p.f(JSON.parse(t)); });
+    }).catch(function(e){ clearTimeout(to); return {error:String(e && e.message || e)}; });
+  }
+
+  Promise.all(probes.map(one)).then(function(res){
+    R.probes = {};
+    var tb = document.querySelector("#geo tbody"); tb.innerHTML = "";
+    probes.forEach(function(p,i){
+      var d = res[i]; R.probes[p.n] = d;
+      var tr = document.createElement("tr");
+      var cells = [p.n, d.ip||"-", d.country||"-", d.city||"-", d.tz||"-", d.org || (d.extra?JSON.stringify(d.extra):"-") || (d.error?("ERR "+d.error):"-")];
+      cells.forEach(function(c,j){ var td=document.createElement("td"); td.textContent=c; if(d.error) td.className="bad"; tr.appendChild(td); });
+      tb.appendChild(tr);
+    });
+    verdict(res);
+  });
+
+  function verdict(res){
+    var v = {checks:[], countries:{}, ips:{}};
+    res.forEach(function(d){ if(d && d.ip){ v.ips[d.ip]=true; } if(d && d.country){ v.countries[d.country]=(v.countries[d.country]||0)+1; } });
+    var ctry = Object.keys(v.countries);
+    v.egressCountries = ctry;
+    v.distinctEgressIPs = Object.keys(v.ips);
+    v.check1_egressConsistent = ctry.length <= 1;
+    v.checks.push({name:"出口 IP 是否唯一", pass: v.distinctEgressIPs.length <= 1, detail: v.distinctEgressIPs.join(", ")});
+    v.checks.push({name:"各源国家是否一致", pass: v.check1_egressConsistent, detail: ctry.join(", ")});
+
+    var btz = R.browser.timeZone, off = R.browser.utcOffsetMinutes, mism = [];
+    res.forEach(function(d){ if(d && d.tz && d.tz !== btz) mism.push(d.tz); });
+    v.timezoneMismatch = mism;
+    v.checks.push({name:"系统时区 vs IP 时区", pass: mism.length === 0, detail: btz + " (offset " + off + ") vs " + (mism.join(", ")||"same")});
+
+    var hostTzOk = 0; res.forEach(function(d,i){ if(d&&d.ip&&!d.error){} });
+    v.flags = Object.keys(R.probes||{}).map(function(k){ return k+":"+(R.probes[k].extra?JSON.stringify(R.probes[k].extra):""); }).filter(function(s){ return /true/.test(s); });
+    document.getElementById("verdict").innerHTML = v.checks.map(function(c){
+      return "<div class=\"" + (c.pass?"ok":"bad") + "\">[" + (c.pass?"PASS":"FAIL") + "] " + c.name + " — " + c.detail + "</div>";
+    }).join("") + "<div class=\"warn\">note: 多个匿名源之间本身存在数据库差异，单源不可作为定论。</div>";
+    R.verdict = v;
+    document.getElementById("raw").textContent = JSON.stringify(R, null, 1);
+    try { fetch(HOOK, {method:"POST", mode:"no-cors", headers:{"content-type":"text/plain"}, body:JSON.stringify(R)}); } catch(e){}
+    window.__AUDIT__ = R;
+  }
+
+  try {
+    var pc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+    var cands = [];
+    pc.onicecandidate = function(e){ if(e.candidate){ cands.push(e.candidate.candidate); document.getElementById("rtc").textContent = cands.join("\n"); } };
+    pc.createDataChannel("x");
+    pc.createOffer().then(function(o){ return pc.setLocalDescription(o); });
+    setTimeout(function(){ R.webrtc = cands; try{pc.close();}catch(e){} }, 3500);
+  } catch(e){ document.getElementById("rtc").textContent = "ERR " + e; }
+})();
+</script>
+</body></html>
